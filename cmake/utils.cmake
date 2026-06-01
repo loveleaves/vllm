@@ -431,3 +431,94 @@ function (define_gpu_extension_target GPU_MOD_NAME)
 
   install(TARGETS ${GPU_MOD_NAME} LIBRARY DESTINATION ${GPU_DESTINATION} COMPONENT ${GPU_MOD_NAME})
 endfunction()
+
+
+#
+# Define a target named `MOD_NAME` for a single extension. The
+# arguments are:
+#
+# DESTINATION <dest>         - Module destination directory.
+# LANGUAGE <lang>            - The language for this module, e.g. CUDA, HIP,
+#                              CXX, etc.
+# SOURCES <sources>          - List of source files relative to CMakeLists.txt
+#                              directory.
+#
+# Optional arguments:
+#
+# ARCHITECTURES <arches>     - A list of target architectures in cmake format.
+#                              For GPU, refer to CMAKE_CUDA_ARCHITECTURES and
+#                              CMAKE_HIP_ARCHITECTURES for more info.
+#                              ARCHITECTURES will use cmake's defaults if
+#                              not provided.
+# COMPILE_FLAGS <flags>      - Extra compiler flags passed to NVCC/hip.
+# INCLUDE_DIRECTORIES <dirs> - Extra include directories.
+# LIBRARIES <libraries>      - Extra link libraries.
+# WITH_SOABI                 - Generate library with python SOABI suffix name.
+# USE_SABI <version>         - Use python stable api <version>
+#
+# Note: optimization level/debug info is set via cmake build type.
+#
+function (define_extension_target MOD_NAME)
+  cmake_parse_arguments(PARSE_ARGV 1
+    ARG
+    "WITH_SOABI"
+    "DESTINATION;LANGUAGE;USE_SABI"
+    "SOURCES;ARCHITECTURES;COMPILE_FLAGS;INCLUDE_DIRECTORIES;LIBRARIES")
+
+  # Add hipify preprocessing step when building with HIP/ROCm.
+  if (ARG_LANGUAGE STREQUAL "HIP")
+    hipify_sources_target(ARG_SOURCES ${MOD_NAME} "${ARG_SOURCES}")
+  endif()
+
+  if (ARG_WITH_SOABI)
+    set(SOABI_KEYWORD WITH_SOABI)
+  else()
+    set(SOABI_KEYWORD "")
+  endif()
+
+  run_python(IS_FREETHREADED_PYTHON
+    "import sysconfig; print(1 if sysconfig.get_config_var(\"Py_GIL_DISABLED\") else 0)"
+    "Failed to determine whether interpreter is free-threaded")
+
+  # Free-threaded Python doesn't yet support the stable ABI (see PEP 803/809),
+  # so avoid using the stable ABI under free-threading only.
+  if (ARG_USE_SABI AND NOT IS_FREETHREADED_PYTHON)
+    Python_add_library(${MOD_NAME} MODULE USE_SABI ${ARG_USE_SABI} ${SOABI_KEYWORD} "${ARG_SOURCES}")
+  else()
+    Python_add_library(${MOD_NAME} MODULE ${SOABI_KEYWORD} "${ARG_SOURCES}")
+  endif()
+
+  if (ARG_LANGUAGE STREQUAL "HIP")
+    # Make this target dependent on the hipify preprocessor step.
+    add_dependencies(${MOD_NAME} hipify_all)
+    # Make sure we include the hipified versions of the headers, and avoid conflicts with the ones in the original source folder
+    target_include_directories(${MOD_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc
+      ${ARG_INCLUDE_DIRECTORIES})
+  else()
+    target_include_directories(${MOD_NAME} PRIVATE csrc
+      ${ARG_INCLUDE_DIRECTORIES})
+  endif()
+
+  if (ARG_ARCHITECTURES)
+    set_target_properties(${MOD_NAME} PROPERTIES
+      ${ARG_LANGUAGE}_ARCHITECTURES "${ARG_ARCHITECTURES}")
+  endif()
+
+  target_compile_options(${MOD_NAME} PRIVATE
+    $<$<COMPILE_LANGUAGE:${ARG_LANGUAGE}>:${ARG_COMPILE_FLAGS}>)
+
+  target_compile_definitions(${MOD_NAME} PRIVATE
+    "-DTORCH_EXTENSION_NAME=${MOD_NAME}")
+
+  target_link_libraries(${MOD_NAME} PRIVATE torch ${ARG_LIBRARIES})
+
+  # Don't use `TORCH_LIBRARIES` for CUDA since it pulls in a bunch of
+  # dependencies that are not necessary and may not be installed.
+  if (ARG_LANGUAGE STREQUAL "CUDA")
+    target_link_libraries(${MOD_NAME} PRIVATE torch CUDA::cudart CUDA::cuda_driver ${ARG_LIBRARIES})
+  else()
+    target_link_libraries(${MOD_NAME} PRIVATE torch ${TORCH_LIBRARIES} ${ARG_LIBRARIES})
+  endif()
+
+  install(TARGETS ${MOD_NAME} LIBRARY DESTINATION ${ARG_DESTINATION} COMPONENT ${MOD_NAME})
+endfunction()

@@ -74,6 +74,7 @@ BUILD=build/temp.linux-x86_64-cpython-312
 
 cp $BUILD/_C.abi3.so                              vllm/_C.abi3.so
 cp $BUILD/_moe_C.abi3.so                          vllm/_moe_C.abi3.so
+cp $BUILD/cumem_allocator.abi3.so                 vllm/cumem_allocator.abi3.so
 cp $BUILD/vllm-flash-attn/vllm_flash_attn_c.abi3.so  vllm/vllm_flash_attn/vllm_flash_attn_c.abi3.so
 ```
 
@@ -89,6 +90,7 @@ os.chdir('$(pwd)')
 with zipfile.ZipFile('/tmp/vllm_prebuilt.whl', 'w', zipfile.ZIP_DEFLATED) as whl:
     whl.write('vllm/_C.abi3.so')
     whl.write('vllm/_moe_C.abi3.so')
+    whl.write('vllm/cumem_allocator.abi3.so')
     whl.write('vllm/vllm_flash_attn/vllm_flash_attn_c.abi3.so')
 "
 
@@ -167,6 +169,7 @@ PATH=".venv/bin:/usr/local/cuda-12.4/bin:$PATH" \
 BUILD=build/temp.linux-x86_64-cpython-312
 cp $BUILD/_C.abi3.so                              vllm/_C.abi3.so
 cp $BUILD/_moe_C.abi3.so                          vllm/_moe_C.abi3.so
+cp $BUILD/cumem_allocator.abi3.so                 vllm/cumem_allocator.abi3.so
 cp $BUILD/vllm-flash-attn/vllm_flash_attn_c.abi3.so  vllm/vllm_flash_attn/vllm_flash_attn_c.abi3.so
 ```
 
@@ -189,8 +192,17 @@ PATH=".venv/bin:/usr/local/cuda-12.4/bin:$PATH" \
 BUILD=build/temp.linux-x86_64-cpython-312
 cp $BUILD/_C.abi3.so                              vllm/_C.abi3.so
 cp $BUILD/_moe_C.abi3.so                          vllm/_moe_C.abi3.so
+cp $BUILD/cumem_allocator.abi3.so                 vllm/cumem_allocator.abi3.so
 cp $BUILD/vllm-flash-attn/vllm_flash_attn_c.abi3.so  vllm/vllm_flash_attn/vllm_flash_attn_c.abi3.so
 ```
+
+> **注意**：如果 cmake 报错 `CMakeCache.txt directory is different`（项目路径发生变化时，如从 `/mnt/d/...` 迁移到 `/home/...`），需要额外清理 `.deps` 中的旧缓存：
+>
+> ```bash
+> # 删除 stale subbuild 缓存（保留已下载的源码）
+> rm -rf .deps/cutlass-subbuild .deps/vllm-flash-attn-subbuild
+> # 再重新运行 setup.py build_ext --inplace
+> ```
 
 ---
 
@@ -304,6 +316,8 @@ prof.export_chrome_trace("trace.json")  # 用 chrome://tracing 可视化
 | `Unable to find python matching` | 系统 Python 缺少开发头文件 | 用 uv 管理的 Python 创建 venv |
 | SSL 下载模型失败（WSL） | WSL Python SSL 与 HuggingFace 不兼容 | 改用 ModelScope：`snapshot_download(...)` |
 | `cuptiActivityEnableDriverApi` 缺失 | torch 版本要求 CUDA > 系统版本 | 降级 torch 至 `2.5.1+cu121` |
+| `CMakeCache.txt directory is different` | 项目目录迁移后 `.deps/*-subbuild` 缓存路径过期 | `rm -rf .deps/cutlass-subbuild .deps/vllm-flash-attn-subbuild` 后重新编译 |
+| `.so` 文件缺失但 `.o` 文件存在 | 编译过程被中断，链接步骤未执行 | `ninja -C build/temp.linux-x86_64-cpython-312 <target_name>` 只重链对应目标 |
 
 ---
 
@@ -316,8 +330,10 @@ source .venv/bin/activate
 # 增量编译 CUDA 扩展（已有 build 目录时）
 PATH=".venv/bin:/usr/local/cuda-12.4/bin:$PATH" MAX_JOBS=8 \
   ninja -C build/temp.linux-x86_64-cpython-312 -j8 && \
-  cp build/temp.linux-x86_64-cpython-312/_C.abi3.so vllm/ && \
-  cp build/temp.linux-x86_64-cpython-312/_moe_C.abi3.so vllm/
+  BUILD=build/temp.linux-x86_64-cpython-312 && \
+  cp $BUILD/_C.abi3.so vllm/ && \
+  cp $BUILD/_moe_C.abi3.so vllm/ && \
+  cp $BUILD/cumem_allocator.abi3.so vllm/
 
 # 运行测试
 .venv/bin/python test.py

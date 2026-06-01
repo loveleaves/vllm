@@ -182,6 +182,35 @@ message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
 #
 
 #
+# cumem_allocator extension（vLLM sleep mode 所需的 CUDA VMM 分配器）
+#
+set(VLLM_CUMEM_EXT_SRC
+  "csrc/cumem_allocator.cpp")
+
+# 为各 CUDA 架构生成代码
+set_gencode_flags_for_srcs(
+  SRCS "${VLLM_CUMEM_EXT_SRC}"
+  CUDA_ARCHS "${CUDA_ARCHS}")
+
+# 只有 CUDA 平台才编译此扩展
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  message(STATUS "Enabling cumem allocator extension.")
+
+  # CUDA：链接 CUDA Driver 库
+  list(APPEND CUMEM_LIBS CUDA::cuda_driver)
+
+  # 定义扩展目标（vLLM 自定义宏，输出到 vllm/ 目录）
+  define_extension_target(
+    cumem_allocator         # 扩展名称
+    DESTINATION vllm        # 输出目录（vllm/cumem_allocator.so）
+    LANGUAGE CXX            # 用 C++ 编译器
+    SOURCES ${VLLM_CUMEM_EXT_SRC}
+    LIBRARIES ${CUMEM_LIBS}
+    USE_SABI 3.8            # 使用稳定 ABI（兼容 Python 3.8+）
+    WITH_SOABI)             # 文件名包含 Python ABI 标记
+endif()
+
+#
 # _C extension
 #
 

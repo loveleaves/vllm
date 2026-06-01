@@ -1411,41 +1411,6 @@ endif()
 
 ### Step 3：编译构建 C 扩展
 
-有两种方式编译：
-
-#### 方式 A：完整安装（推荐，第一次使用）
-
-```bash
-# 编译所有 C 扩展并安装（包括 cumem_allocator）
-# --torch-backend=auto 自动选择 CUDA/ROCm
-uv pip install -e . --torch-backend=auto
-
-# 编译完成后验证扩展存在
-ls vllm/cumem_allocator*.so   # 应该能看到 .so 文件
-python -c "from vllm.cumem_allocator import init_module; print('OK')"
-```
-
-#### 方式 B：仅编译 cumem_allocator（修改 C 代码后重新编译）
-
-```bash
-# 先找到构建目录
-BUILD_DIR=$(python -c "import vllm; import os; print(os.path.dirname(vllm.__file__) + '/../build')" 2>/dev/null || echo "build")
-
-# 只重新编译 cumem_allocator 目标
-cmake --build "$BUILD_DIR" --target cumem_allocator -j$(nproc)
-
-# 手动复制到 vllm 目录（开发模式下可能需要）
-cp "$BUILD_DIR"/vllm/cumem_allocator*.so vllm/
-```
-
-#### 方式 C：使用预编译二进制（只改 Python 代码时）
-
-```bash
-# 如果只修改 Python 代码，不需要重新编译 C 扩展
-# 使用已发布版本的预编译 .so
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-```
-
 #### 验证编译成功
 
 ```python
