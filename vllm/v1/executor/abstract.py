@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 from vllm.config import VllmConfig
 from vllm.v1.outputs import ModelRunnerOutput
@@ -7,6 +7,8 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 class Executor(ABC):
     """Abstract class for executors."""
+
+    is_sleeping: bool = False
 
     @abstractmethod
     def __init__(self, vllm_config: VllmConfig) -> None:
@@ -37,4 +39,10 @@ class Executor(ABC):
 
     @abstractmethod
     def check_health(self) -> None:
+        raise NotImplementedError
+
+    def sleep(self, level: int = 1) -> None:
+        raise NotImplementedError
+
+    def wake_up(self, tags: Optional[List[str]] = None) -> None:
         raise NotImplementedError

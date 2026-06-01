@@ -111,6 +111,9 @@ class Platform:
         """Stateless version of :func:`torch.cuda.is_available`."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
 
+    def is_sleep_mode_available(self) -> bool:
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+
     @classmethod
     def get_default_attn_backend(cls, selected_backend: _Backend):
         """Get the default attention backend of a device."""

@@ -113,6 +113,8 @@ uv pip install --python .venv/bin/python modelscope
 
 ## 二、验证安装
 
+### 普通推理验证
+
 运行 `test.py`：
 
 ```bash
@@ -142,6 +144,25 @@ for o in outputs:
     print(o.outputs[0].text)
     print("---")
 ```
+
+### Sleep mode 功能验证
+
+需要使用 V1 引擎（V0 引擎不含 sleep 实现）：
+
+```bash
+# 基础 allocator 测试（无需完整模型，快速验证 C 扩展和 cumem 机制）
+.venv/bin/python tests/sleep_mode/test_cumem_basic.py
+
+# 端到端 level 1 测试（offload 权重到 CPU，wake_up 后推理结果一致）
+VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  .venv/bin/python tests/sleep_mode/test_end_to_end_level1.py
+
+# 端到端 level 2 测试（分步唤醒 + reload_weights）
+VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  .venv/bin/python tests/sleep_mode/test_end_to_end_level2_partial_wakeup.py
+```
+
+> **注意**：端到端测试每个文件独立运行；不建议在同一个 Python 进程中连续初始化多个 `LLM(enable_sleep_mode=True)` 实例（`CuMemAllocator` 是进程级单例）。
 
 ---
 
@@ -318,6 +339,9 @@ prof.export_chrome_trace("trace.json")  # 用 chrome://tracing 可视化
 | `cuptiActivityEnableDriverApi` 缺失 | torch 版本要求 CUDA > 系统版本 | 降级 torch 至 `2.5.1+cu121` |
 | `CMakeCache.txt directory is different` | 项目目录迁移后 `.deps/*-subbuild` 缓存路径过期 | `rm -rf .deps/cutlass-subbuild .deps/vllm-flash-attn-subbuild` 后重新编译 |
 | `.so` 文件缺失但 `.o` 文件存在 | 编译过程被中断，链接步骤未执行 | `ninja -C build/temp.linux-x86_64-cpython-312 <target_name>` 只重链对应目标 |
+| `sleep()` 后显存释放接近 0 | `enable_cumem_allocator` 未正确启用（验证代码放错类） | 确认 sleep mode 验证逻辑在 `ModelConfig.__init__` 末尾，不在其他类的 `__post_init__` 中 |
+| `max_seq_len > max tokens in KV cache` | V1 引擎 + torch.compile 占用更多显存 | 初始化时设置 `max_model_len=2048` |
+| `TypeError: load_model() got unexpected keyword argument 'load_dummy_weights'` | V1 `GPUModelRunner.load_model()` 不接受参数 | Worker 的 `load_model` 调用改为 `self.model_runner.load_model()`（无参数）|
 
 ---
 

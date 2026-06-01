@@ -210,3 +210,9 @@ class LLMEngine:
     def shutdown(self):
         if engine_core := getattr(self, "engine_core", None):
             engine_core.shutdown()
+
+    def sleep(self, level: int = 1) -> None:
+        self.engine_core.sleep(level)
+
+    def wake_up(self, tags=None) -> None:
+        self.engine_core.wake_up(tags)

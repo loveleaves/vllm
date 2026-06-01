@@ -570,6 +570,38 @@ class LLM:
 
         return outputs
 
+    def collective_rpc(self, method: str, args=(), kwargs=None):
+        """Broadcast an RPC call to all workers."""
+        engine = self.llm_engine
+        # V1 LLMEngine: engine_core is EngineCoreClient (InprocClient)
+        if hasattr(engine, 'engine_core') and hasattr(engine.engine_core, 'engine_core'):
+            executor = engine.engine_core.engine_core.model_executor
+        elif hasattr(engine, 'model_executor'):
+            executor = engine.model_executor
+        else:
+            raise RuntimeError("Cannot find model_executor for collective_rpc")
+        if hasattr(executor, 'collective_rpc'):
+            return executor.collective_rpc(method, args=args, kwargs=kwargs or {})
+        # UniprocExecutor: direct worker call
+        return [getattr(executor.worker, method)(*args, **(kwargs or {}))]
+
+    def sleep(self, level: int = 1) -> None:
+        """Release GPU memory.
+
+        level=1: offload weights to CPU, discard KV cache.
+        level=2: discard all GPU memory (weights + KV cache).
+        """
+        self.llm_engine.sleep(level=level)
+
+    def wake_up(self, tags=None) -> None:
+        """Restore GPU memory after sleep.
+
+        tags=None: restore everything.
+        tags=["weights"]: restore only weights (step 1 of partial wake-up).
+        tags=["kv_cache"]: restore only KV cache (step 2 of partial wake-up).
+        """
+        self.llm_engine.wake_up(tags)
+
     def chat(
         self,
         messages: Union[List[ChatCompletionMessageParam],

@@ -12,7 +12,7 @@ from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader import get_model, get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.sampling_params import SamplingType
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
@@ -752,3 +752,16 @@ class GPUModelRunner:
                 torch.zeros(kv_cache_shape,
                             dtype=self.kv_cache_dtype,
                             device=self.device))
+
+    def reload_weights(self) -> None:
+        """从磁盘重新加载权重到已有模型（level 2 wake_up 后调用）。"""
+        loader = get_model_loader(self.vllm_config.load_config)
+        self.model.load_weights(
+            loader._get_all_weights(self.model_config, self.model))
+        logger.info("Weights reloaded from %s", self.model_config.model)
+
+    def post_kv_cache_wake_up(self) -> None:
+        """wake_up 后修复 FP8 KV Cache scale。非 FP8 情况下是空操作。"""
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            for cache_tensor in self.kv_caches:
+                cache_tensor.zero_()

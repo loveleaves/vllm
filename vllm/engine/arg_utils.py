@@ -123,6 +123,8 @@ class EngineArgs:
     max_num_seqs: Optional[int] = None
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
     disable_log_stats: bool = False
+    enable_sleep_mode: bool = False
+    enable_cumem_allocator: bool = False
     revision: Optional[str] = None
     code_revision: Optional[str] = None
     rope_scaling: Optional[Dict[str, Any]] = None
@@ -1000,7 +1002,9 @@ class EngineArgs:
             override_neuron_config=self.override_neuron_config,
             override_pooler_config=self.override_pooler_config,
             logits_processor_pattern=self.logits_processor_pattern,
-            generation_config=self.generation_config)
+            generation_config=self.generation_config,
+            enable_sleep_mode=self.enable_sleep_mode,
+            enable_cumem_allocator=self.enable_cumem_allocator)
 
     def create_load_config(self) -> LoadConfig:
         return LoadConfig(

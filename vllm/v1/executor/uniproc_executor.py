@@ -1,5 +1,6 @@
 import os
-from typing import Optional, Tuple
+import time
+from typing import List, Optional, Tuple
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -82,3 +83,17 @@ class UniprocExecutor(Executor):
         # UniprocExecutor will always be healthy as long as
         # it's running.
         return
+
+    def sleep(self, level: int = 1) -> None:
+        t0 = time.perf_counter()
+        self.worker.sleep(level)
+        logger.info("It took %.6f seconds to fall asleep.", time.perf_counter() - t0)
+        self.is_sleeping = True
+
+    def wake_up(self, tags: Optional[List[str]] = None) -> None:
+        t0 = time.perf_counter()
+        self.worker.wake_up(tags)
+        logger.info("It took %.6f seconds to wake up tags %s.",
+                    time.perf_counter() - t0, tags)
+        if tags is None:
+            self.is_sleeping = False

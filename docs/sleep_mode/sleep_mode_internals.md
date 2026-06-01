@@ -520,14 +520,9 @@ def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
 
 ```python
 def load_model(self, *, load_dummy_weights: bool = False) -> None:
-    with (
-        self._maybe_get_memory_pool_context(tag="weights"),  # ← 权重标记为 "weights"
-        set_current_vllm_config(self.vllm_config),
-        self._scoped_allocator_max_split(max_split_size_mb=20),
-        # max_split_size_mb=20 减少分配碎片化，
-        # 代价是更多次 cuMemCreate 调用（对模型加载影响可忽略）
-    ):
-        self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+    with self._maybe_get_memory_pool_context(tag="weights"):  # ← 权重标记为 "weights"
+        self.model_runner.load_model()
+        # 注意：不传 load_dummy_weights —— V1 GPUModelRunner.load_model() 无此参数
 ```
 
 **`initialize_from_config`（KV Cache 进入 "kv_cache" 池）**：
@@ -589,39 +584,19 @@ def wake_up(self, tags: list[str] | None = None) -> None:
         self.model_runner.post_kv_cache_wake_up()
 ```
 
-**`post_kv_cache_wake_up`（`gpu_model_runner.py:927`）**：
+**`post_kv_cache_wake_up`（`gpu_model_runner.py`）**：
 
-Wake up 后，新映射的物理内存内容是**未定义的**（操作系统给的"脏"内存）。对于 FP8 KV Cache 会引发灾难性后果：
+Wake up 后，新映射的物理内存内容是**未定义的**（操作系统给的"脏"内存）。对于 FP8 KV Cache 会引发灾难性后果（scale 为 0 → 所有 KV 值为 0 → 输出乱码），需要清零并恢复 scale：
 
 ```python
 def post_kv_cache_wake_up(self) -> None:
-    self.init_fp8_kv_scales()
-
-def init_fp8_kv_scales(self) -> None:
-    """
-    修复 FP8 KV Cache wake_up 后的两个问题：
-    1. KV Cache tensor 内容是随机垃圾 → zero_() 清零
-    2. Attention 层的 _k_scale/_v_scale 默认值是 0.0 →
-       导致所有 KV 计算结果为 0 → 输出乱码
-       → 重置为 1.0
-    """
-    if not is_quantized_kv_cache(self.cache_config.cache_dtype):
-        return  # 非 FP8 量化不需要处理
-
-    # 清零 KV Cache
-    for cache_tensor in self.kv_caches:
-        cache_tensor.zero_()
-
-    # 重置 attention 层的 FP8 scale
-    for name, module in self.compilation_config.static_forward_context.items():
-        if isinstance(module, (Attention, MLAAttention)):
-            for attr in ("_k_scale", "k_scale"):
-                if hasattr(module, attr) and isinstance(getattr(module, attr), torch.Tensor):
-                    getattr(module, attr).fill_(1.0)
-            for attr in ("_v_scale", "v_scale"):
-                if hasattr(module, attr) and isinstance(getattr(module, attr), torch.Tensor):
-                    getattr(module, attr).fill_(1.0)
+    """wake_up 后修复 FP8 KV Cache。非 FP8 情况下是空操作。"""
+    if self.kv_cache_dtype == torch.float8_e4m3fn:
+        for cache_tensor in self.kv_caches:
+            cache_tensor.zero_()
 ```
+
+新版 vLLM（PR #28783）中该方法还会重置 Attention 层的 `_k_scale`/`_v_scale`，v0.6.6 不需要（无 FP8 Attention scale 机制）。
 
 ### 5.4 Layer 3：Executor（`vllm/v1/executor/abstract.py`）
 
@@ -1811,28 +1786,45 @@ def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
 def load_model(self, *, load_dummy_weights: bool = False) -> None:
     with (
         self._maybe_get_memory_pool_context(tag="weights"),  # ← 新增这一行
-        # ... 其他已有的上下文管理器 ...
     ):
-        self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        self.model_runner.load_model()
 ```
 
-> **实际代码位置**：`vllm/v1/worker/gpu_worker.py` 的 `Worker.load_model` 方法，在现有代码基础上用 `with self._maybe_get_memory_pool_context(tag="weights"):` 包裹 `self.model_runner.load_model(...)` 调用即可。
+> **v0.6.6 注意**：V1 `GPUModelRunner.load_model()` 不接受任何参数（无 `load_dummy_weights`）。新版 Worker 可能有该参数，但调用 `model_runner` 时不能传递，否则会 `TypeError`。
 
-#### 5.4 修改 `initialize_from_config`（或 `initialize_cache`）方法
+#### 5.4 修改 `initialize_cache` 方法
 
-找到分配 KV Cache 的方法（旧版可能叫 `initialize_cache`，新版叫 `initialize_from_config`），用 `_maybe_get_memory_pool_context("kv_cache")` 包裹：
+> **版本说明**：本文档参考的是较新版本的 vLLM，其中该方法已重构为 `initialize_from_config(kv_cache_config: KVCacheConfig)`。当前 v0.6.6 版本仍使用旧接口 `initialize_cache(num_gpu_blocks: int)`，调用方式略有不同，但核心改动相同：用 `_maybe_get_memory_pool_context("kv_cache")` 包裹 `initialize_kv_cache` 调用。
+
+**当前版本（v0.6.6）的修改**：
+
+```python
+def initialize_cache(self, num_gpu_blocks: int) -> None:
+    """Allocate GPU and CPU KV cache with the specified number of blocks."""
+    if num_gpu_blocks <= 0:
+        raise ValueError(...)
+
+    # ... 已有的参数校验 ...
+
+    with self._maybe_get_memory_pool_context(tag="kv_cache"):  # ← 新增这一行
+        self.model_runner.initialize_kv_cache(num_gpu_blocks)
+```
+
+**新版本（`initialize_from_config` 接口）的等价写法**（供参考）：
 
 ```python
 def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
     self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
-    with self._maybe_get_memory_pool_context(tag="kv_cache"):  # ← 新增这一行
+    with self._maybe_get_memory_pool_context(tag="kv_cache"):
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     # 注意：KV zero metadata 故意在 pool 外分配（不参与 sleep/wake 循环）
     if kv_cache_config.needs_kv_cache_zeroing:
         self.model_runner._init_kv_zero_meta()
 ```
+
+**两个版本的本质差异**：新版将 KVCache 的配置（block 数量、大小、零化需求等）封装到 `KVCacheConfig` 对象中，由 Scheduler 统一计算后下发，而旧版只传递 `num_gpu_blocks` 整数。核心的 cumem pool 上下文包裹逻辑完全相同。
 
 #### 5.5 添加 `sleep` 方法
 
@@ -1906,152 +1898,106 @@ def wake_up(self, tags: list[str] | None = None) -> None:
 
 #### 5.7 在 `GPUModelRunner` 中添加 FP8 修复（`gpu_model_runner.py`）
 
-`wake_up` 后新映射的物理内存内容是**未定义的**（操作系统随机内容）。对于 FP8 KV Cache，这会导致 scale 值为 0，进而让所有 KV 值变为 0，输出乱码。在 `gpu_model_runner.py` 的 `GPUModelRunner` 类中添加：
+`wake_up` 后新映射的物理内存内容是**未定义的**（操作系统随机内容）。对于 FP8 KV Cache，这会导致输出乱码。在 `gpu_model_runner.py` 的 `GPUModelRunner` 类中添加：
 
 ```python
 def post_kv_cache_wake_up(self) -> None:
     """wake_up 后修复 FP8 KV Cache。非 FP8 情况下是空操作。"""
-    self.init_fp8_kv_scales()
-
-@torch.inference_mode()
-def init_fp8_kv_scales(self) -> None:
-    """
-    FP8 KV Cache wake_up 后必须做两件事：
-    1. zero_() 清零 KV Cache（新映射的物理内存内容是随机垃圾）
-    2. 将 Attention 层的 _k_scale/_v_scale 重置为 1.0
-       （新映射的内存中这些 tensor 的值是 0，0 * KV = 0 → 输出乱码）
-    """
-    from vllm.attention import Attention
-    from vllm.model_executor.layers.mamba.mla.mla_attn import MLAAttention
-
-    # 非 FP8 量化：不需要处理
-    if not is_quantized_kv_cache(self.cache_config.cache_dtype):
-        return
-
-    # 清零所有 KV Cache tensor
-    for cache_tensor in getattr(self, "kv_caches", []):
-        if cache_tensor is not None:
+    if self.kv_cache_dtype == torch.float8_e4m3fn:
+        for cache_tensor in self.kv_caches:
             cache_tensor.zero_()
+```
 
-    # 重置 Attention 层的 scale
-    k_attrs = ("_k_scale", "k_scale")
-    v_attrs = ("_v_scale", "v_scale")
-    for name, module in self.compilation_config.static_forward_context.items():
-        if isinstance(module, (Attention, MLAAttention)):
-            for attr in k_attrs:
-                if hasattr(module, attr):
-                    param = getattr(module, attr)
-                    if isinstance(param, torch.Tensor):
-                        param.fill_(1.0)
-            for attr in v_attrs:
-                if hasattr(module, attr):
-                    param = getattr(module, attr)
-                    if isinstance(param, torch.Tensor):
-                        param.fill_(1.0)
+> **v0.6.6 说明**：当前版本的 `GPUModelRunner` 用 `self.kv_cache_dtype` 字段直接判断。新版 vLLM 使用 `is_quantized_kv_cache()` 辅助函数，并额外重置 Attention 层的 `_k_scale`/`_v_scale`（见 PR #28783）。当前简化版在非 FP8 场景（`dtype=bfloat16`）下是空操作，行为正确。
+
+#### 5.8 在 `GPUModelRunner` 和 `Worker` 中添加 `reload_weights`
+
+Level 2 sleep 丢弃了所有权重，`wake_up(tags=["weights"])` 只重建了虚拟地址到物理内存的映射，内容是随机垃圾。需要重新从磁盘加载权重（RLHF 场景下则是加载训练框架写入的新权重）。
+
+在 `GPUModelRunner` 中添加：
+
+```python
+from vllm.model_executor.model_loader import get_model, get_model_loader
+
+def reload_weights(self) -> None:
+    """从磁盘重新加载权重到已有模型（level 2 wake_up 后调用）。"""
+    loader = get_model_loader(self.vllm_config.load_config)
+    self.model.load_weights(
+        loader._get_all_weights(self.model_config, self.model))
+    logger.info("Weights reloaded from %s", self.model_config.model)
+```
+
+在 `Worker` 中添加（供 `collective_rpc` 广播调用）：
+
+```python
+def reload_weights(self) -> None:
+    """level 2 wake_up 后重新加载权重。"""
+    self.model_runner.reload_weights()
+```
+
+调用示例：
+
+```python
+llm.sleep(level=2)
+llm.wake_up(tags=["weights"])          # 重建虚拟地址→物理内存映射（内容为垃圾）
+llm.collective_rpc("reload_weights")   # 重新从磁盘加载权重
+llm.wake_up(tags=["kv_cache"])
+output = llm.generate(...)
 ```
 
 ---
 
 ### Step 6：修改配置层
 
-#### 6.1 在 `ModelConfig` 中添加字段（`vllm/config/model.py` 或 `vllm/config.py`）
+> **版本说明**：新版将 `ModelConfig` 重构为 dataclass（字段即构造参数）。v0.6.6 的 `ModelConfig` 是普通类，字段在 `__init__` 末尾以实例变量方式赋值，需要改为构造参数并同步更新 `EngineArgs` 和 `create_model_config()`。平台接口中也需新增 `is_sleep_mode_available()`。
 
-找到 `ModelConfig` dataclass，添加两个新字段：
+#### 6.1 `ModelConfig.__init__` 添加参数（`vllm/config.py`）
 
-```python
-@dataclasses.dataclass
-class ModelConfig:
-    # ...已有字段...
-
-    # 新增：sleep mode 开关（用户通过 --enable-sleep-mode 开启）
-    enable_sleep_mode: bool = False
-
-    # 新增：cumem 分配器开关（可独立于 sleep mode 开启，但 sleep mode 依赖它）
-    enable_cumem_allocator: bool = False
-```
-
-在 `ModelConfig.__post_init__` 方法中添加验证逻辑（找到 `def __post_init__` 方法，在其中添加）：
+在 `__init__` 参数列表末尾添加（同时移除原来硬编码为 `False` 的实例变量赋值）：
 
 ```python
-def __post_init__(self):
-    # ...已有验证...
-
-    # sleep mode 前提检查
-    if self.enable_sleep_mode:
-        # 检查 1：平台是否支持（必须是 CUDA 或 ROCm）
-        if not current_platform.is_sleep_mode_available():
-            raise ValueError(
-                "Sleep mode is not supported on current platform. "
-                "Only CUDA and ROCm are supported."
-            )
-        # 连锁效应：sleep mode 必须使用 cumem 分配器
-        if not self.enable_cumem_allocator:
-            logger.info(
-                "Enabling cumem allocator because sleep mode requires it."
-            )
-            self.enable_cumem_allocator = True
-
-    # cumem 分配器前提检查（CPU-only 环境下无法编译 C 扩展）
-    if self.enable_cumem_allocator:
-        from vllm.device_allocator.cumem import cumem_available
-        if not cumem_available:
-            raise ValueError(
-                "cumem allocator is not available. "
-                "Ensure the C extension was compiled (requires CUDA/ROCm)."
-            )
+def __init__(self, ..., enable_sleep_mode: bool = False, enable_cumem_allocator: bool = False):
+    # ...
+    self.enable_sleep_mode = enable_sleep_mode
+    self.enable_cumem_allocator = enable_cumem_allocator
+    # 验证逻辑（已在 __init__ 末尾，会自动执行）
 ```
 
-#### 6.2 在平台接口中添加 `is_sleep_mode_available`（`vllm/platforms/interface.py`）
+验证逻辑放在 `ModelConfig.__init__` 末尾：
 
-找到 `Platform` 基类，添加：
+> **⚠️ 常见陷阱**：`config.py` 中有多个类，每个类都有自己的 `__post_init__` 或方法。添加验证代码时务必确认当前在 `ModelConfig` 类内部，不要误放进 `TokenizerPoolConfig` 或其他类的 `__post_init__` 中。如果放错位置，验证逻辑永远不会被调用（`enable_sleep_mode` 传入后依然是 `False`），导致 cumem pool 未启用、`sleep()` 后释放的显存接近于 0。
 
 ```python
-class Platform:
-    # ...已有方法...
+if self.enable_sleep_mode:
+    if not current_platform.is_sleep_mode_available():
+        raise ValueError("Sleep mode is not supported on current platform.")
+    if not self.enable_cumem_allocator:
+        self.enable_cumem_allocator = True
 
-    def is_sleep_mode_available(self) -> bool:
-        """是否支持 sleep mode（基于 CUDA VMM API）"""
-        # CUDA 和 ROCm 都支持
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+if self.enable_cumem_allocator:
+    from vllm.device_allocator.cumem import cumem_available
+    if not cumem_available:
+        raise ValueError("cumem allocator is not available.")
 ```
 
-#### 6.3 在 `EngineArgs` 中添加 CLI 参数（`vllm/engine/arg_utils.py`）
+#### 6.2 `platforms/interface.py` 添加 `is_sleep_mode_available`
 
-找到 `EngineArgs` dataclass，添加字段：
+```python
+def is_sleep_mode_available(self) -> bool:
+    return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+```
+
+#### 6.3 `EngineArgs` 添加字段并传递给 `ModelConfig`（`vllm/engine/arg_utils.py`）
 
 ```python
 @dataclasses.dataclass
 class EngineArgs:
     # ...已有字段...
-    enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
-    enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
+    enable_sleep_mode: bool = False
+    enable_cumem_allocator: bool = False
 ```
 
-找到 `EngineArgs.add_cli_args` 方法，添加 argument：
-
-```python
-@staticmethod
-def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    # ...已有参数...
-
-    parser.add_argument(
-        "--enable-sleep-mode",
-        action="store_true",
-        default=EngineArgs.enable_sleep_mode,
-        help="Enable sleep mode for RLHF workloads. Allows releasing GPU "
-             "memory while keeping the process alive (no model reload needed).",
-    )
-    parser.add_argument(
-        "--enable-cumem-allocator",
-        action="store_true",
-        default=EngineArgs.enable_cumem_allocator,
-        help="Use the cumem-based CUDA memory allocator. "
-             "Automatically enabled when --enable-sleep-mode is set.",
-    )
-    return parser
-```
-
-找到 `EngineArgs.create_engine_config` 或类似方法，确保字段传递给 `ModelConfig`：
+在 `create_model_config()` 的 `ModelConfig(...)` 调用中添加：
 
 ```python
 def create_model_config(self) -> ModelConfig:
@@ -2062,81 +2008,58 @@ def create_model_config(self) -> ModelConfig:
     )
 ```
 
+这样 `LLM(model, enable_sleep_mode=True)` 通过 `**kwargs` → `EngineArgs` → `create_model_config()` → `ModelConfig` 完整传递。
+
 ---
 
-### Step 7：修改 Executor（`vllm/v1/executor/abstract.py`）
+### Step 7：修改 Executor
 
-Executor 管理一组 Worker（TP 场景下是多个），通过 `collective_rpc` 广播命令。
+> **版本说明**：新版将 `collective_rpc` 提升为 `Executor` 基类方法，并在基类直接实现 `sleep`/`wake_up`（统一走 `collective_rpc`）。v0.6.6 中 `UniprocExecutor` 没有 `collective_rpc`，`MultiprocExecutor` 才有，因此需要分别在两个子类中实现。
 
-找到 `Executor.__init__` 方法，添加状态字段：
+**`abstract.py`** — 添加类变量和非抽象的 `sleep`/`wake_up`（子类各自实现）：
 
 ```python
-class Executor:
-    def __init__(self, ...):
-        # ...已有初始化...
-        self.is_sleeping: bool = False          # 是否处于 sleep 状态
-        self.sleeping_tags: set[str] = set()    # 当前哪些 tags 处于 sleep 状态
+class Executor(ABC):
+    is_sleeping: bool = False   # 类变量，子类实例共享默认值
+
+    def sleep(self, level: int = 1) -> None:
+        raise NotImplementedError
+
+    def wake_up(self, tags=None) -> None:
+        raise NotImplementedError
 ```
 
-在 `Executor` 类中添加 `sleep` 和 `wake_up` 方法：
+**`uniproc_executor.py`** — 直接调用 worker（无 `collective_rpc`）：
 
 ```python
-import time
-
 def sleep(self, level: int = 1) -> None:
-    """
-    广播 sleep 命令到所有 Worker（TP 场景下所有 GPU 同步执行）。
-    """
-    if self.is_sleeping:
-        logger.warning("Executor is already sleeping.")
-        return
-
     t0 = time.perf_counter()
-    # collective_rpc 在单进程场景下直接调用 Worker.sleep()
-    # 在多进程 TP 场景下通过 IPC 管道广播到每个 Worker 进程
-    self.collective_rpc("sleep", kwargs=dict(level=level))
-    logger.info(
-        "It took %.6f seconds to fall asleep.",
-        time.perf_counter() - t0
-    )
-
-    self.sleeping_tags = {"weights", "kv_cache"}
+    self.worker.sleep(level)
+    logger.info("It took %.6f seconds to fall asleep.", time.perf_counter() - t0)
     self.is_sleeping = True
 
-
-def wake_up(self, tags: list[str] | None = None) -> None:
-    """
-    广播 wake_up 命令到所有 Worker。
-    支持分步唤醒：先 wake_up(["weights"])，再 wake_up(["kv_cache"])。
-    """
-    if not self.is_sleeping:
-        logger.warning("Executor is not sleeping.")
-        return
-
-    if tags:
-        for tag in tags:
-            if tag not in self.sleeping_tags:
-                logger.warning(
-                    "Tag %s is not in sleeping tags %s", tag, self.sleeping_tags
-                )
-                return
-
+def wake_up(self, tags=None) -> None:
     t0 = time.perf_counter()
+    self.worker.wake_up(tags)
+    logger.info("It took %.6f seconds to wake up tags %s.", time.perf_counter() - t0, tags)
+    if tags is None:
+        self.is_sleeping = False
+```
+
+**`multiproc_executor.py`** — 通过 `collective_rpc` 广播：
+
+```python
+def sleep(self, level: int = 1) -> None:
+    t0 = time.monotonic()
+    self.collective_rpc("sleep", kwargs=dict(level=level))
+    logger.info("It took %.6f seconds to fall asleep.", time.monotonic() - t0)
+    self.is_sleeping = True
+
+def wake_up(self, tags=None) -> None:
+    t0 = time.monotonic()
     self.collective_rpc("wake_up", kwargs=dict(tags=tags))
-    logger.info(
-        "It took %.6f seconds to wake up tags %s.",
-        time.perf_counter() - t0,
-        tags if tags is not None else self.sleeping_tags,
-    )
-
-    if tags:
-        for tag in tags:
-            self.sleeping_tags.discard(tag)
-    else:
-        self.sleeping_tags.clear()
-
-    # 只有所有 tags 都唤醒了，才认为整体不再 sleeping
-    if not self.sleeping_tags:
+    logger.info("It took %.6f seconds to wake up tags %s.", time.monotonic() - t0, tags)
+    if tags is None:
         self.is_sleeping = False
 ```
 
@@ -2144,118 +2067,42 @@ def wake_up(self, tags: list[str] | None = None) -> None:
 
 ### Step 8：修改 Engine Core（`vllm/v1/engine/core.py`）
 
-Engine Core 负责协调调度器与执行器。sleep 前必须先暂停调度器；wake_up 后必须恢复调度器。
+> **版本说明**：新版 `EngineCore` 实现了完整的调度器暂停状态机（`PauseState` 枚举、`pause_scheduler`/`resume_scheduler`）和 `"wait"` 模式（等 in-flight 请求完成）。v0.6.6 的 `Scheduler` 没有 `set_pause_state`，也没有 `_reset_caches` 方法。
+>
+> v0.6.6 的简化实现：`sleep()` 时直接 abort 所有请求（等价于 `mode="abort"`），不实现 `"wait"` 和 `"keep"` 模式。由于 `LLM.generate()` 是同步阻塞的，实际调用 `sleep()` 时通常已无 in-flight 请求，abort 是安全的。
 
-#### 8.1 添加调度器暂停/恢复方法
+同时需要在 `EngineCoreClient`（基类）和 `InprocClient` 中透传 `sleep`/`wake_up`（`LLMEngine` 通过 `engine_core` 访问）：
 
-先定义 `PauseState` 枚举（如果旧版没有，需要创建）：
-
-```python
-import enum
-
-class PauseState(enum.IntEnum):
-    UNPAUSED = 0     # 正常运行，接受并处理所有请求
-    PAUSED_NEW = 1   # 不接受新请求，当前 in-flight 请求继续处理（abort/wait 模式中间态）
-    PAUSED_ALL = 2   # 所有请求都暂停（keep 模式）
-```
-
-在 `EngineCore` 类中添加暂停相关方法：
+**`core.py`** — 添加到 `EngineCore`：
 
 ```python
-def pause_scheduler(
-    self, mode: str = "abort", clear_cache: bool = True
-) -> None:
-    """
-    暂停调度器。
-
-    mode="abort"（默认）：立即中止所有 in-flight 请求
-    mode="keep"：暂停调度，in-flight 请求进入 PAUSED_ALL 状态（wake_up 后继续）
-    """
-    if mode == "abort":
-        # 中止所有进行中的请求（状态设为 FINISHED_ABORTED）
-        self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
-
-    pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
-    self.scheduler.set_pause_state(pause_state)
-
-    if clear_cache:
-        # 重要：清空 prefix cache！
-        # prefix cache 中存储了指向 KV Cache blocks 的引用
-        # sleep 后 KV Cache 已被释放，这些引用指向无效内存
-        # 不清空会导致 wake_up 后推理结果错误
-        self._reset_caches()  # 清空 prefix cache + multimodal cache + encoder cache
-
-
-def resume_scheduler(self) -> None:
-    """恢复调度器"""
-    self.scheduler.set_pause_state(PauseState.UNPAUSED)
-
-
-def is_scheduler_paused(self) -> bool:
-    """调度器是否处于暂停状态"""
-    return self.scheduler.pause_state != PauseState.UNPAUSED
-```
-
-#### 8.2 添加 `sleep` 方法
-
-```python
-def sleep(self, level: int = 1, mode: str = "abort") -> None:
-    """
-    让引擎进入睡眠。
-
-    level=0：仅暂停调度（不动 GPU 内存，适合短暂暂停）
-    level=1：offload 权重到 CPU，丢弃 KV Cache
-    level=2：丢弃所有 GPU 内存（权重 + KV Cache）
-
-    mode="abort"：立即中止所有请求（RLHF 场景下一轮 rollout 结束后使用）
-    mode="keep"：保留请求到队列，wake_up 后继续（level 0 的典型用法）
-    """
-    # Step 1：暂停调度器
-    # level 0 不需要清 prefix cache（GPU 内存没变，prefix cache 仍然有效）
-    clear_prefix_cache = (level >= 1)
-    self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
-
-    # level 0：只暂停调度，不动 GPU 内存
-    if level < 1:
-        return
-
-    # level 1/2：释放 GPU 内存
+def sleep(self, level: int = 1) -> None:
+    # Abort all in-flight requests before releasing GPU memory.
+    all_ids = list(self.scheduler.requests.keys())
+    if all_ids:
+        self.scheduler.finish_requests(all_ids, RequestStatus.FINISHED_ABORTED)
     self.model_executor.sleep(level)
+
+def wake_up(self, tags: list[str] | None = None) -> None:
+    self.model_executor.wake_up(tags)
 ```
 
-#### 8.3 添加 `wake_up` 方法
+**`core_client.py`** — `EngineCoreClient` 基类添加接口，`InprocClient` 实现透传：
 
 ```python
-def wake_up(self, tags: list[str] | None = None) -> None:
-    """
-    唤醒引擎。
+# EngineCoreClient 基类
+def sleep(self, level: int = 1) -> None:
+    raise NotImplementedError
 
-    tags=None：完整唤醒（恢复所有 GPU 内存 + 恢复调度）
-    tags=["weights"]：只唤醒权重（分步唤醒第一步，调度仍暂停）
-    tags=["kv_cache"]：只唤醒 KV Cache（分步唤醒第二步，调度仍暂停）
-    tags=["scheduling"]：只恢复调度（用于 level 0 的 wake_up）
+def wake_up(self, tags=None) -> None:
+    raise NotImplementedError
 
-    完整 RLHF 分步唤醒流程：
-        sleep(level=2)
-        wake_up(tags=["weights"])   # 第一步：只唤醒权重
-        update_weights(...)          # 训练框架更新权重
-        wake_up(tags=["kv_cache"]) # 第二步：唤醒 KV Cache，恢复推理能力
-    """
-    # 处理 "scheduling" 虚拟 tag（level 0 的唤醒）
-    if tags is not None and "scheduling" in tags:
-        tags = [t for t in tags if t != "scheduling"]
+# InprocClient（in-process，LLM 默认使用）
+def sleep(self, level: int = 1) -> None:
+    self.engine_core.sleep(level)
 
-    # 恢复 GPU 内存（如果有非空的 tags 需要处理）
-    if tags is None or tags:
-        self.model_executor.wake_up(tags)
-
-    # 恢复调度器（所有级别的唤醒都需要）
-    self.resume_scheduler()
-
-
-def is_sleeping(self) -> bool:
-    """引擎在任何层面 sleeping（调度暂停或 GPU 内存释放）都返回 True"""
-    return self.is_scheduler_paused() or self.model_executor.is_sleeping
+def wake_up(self, tags=None) -> None:
+    self.engine_core.wake_up(tags)
 ```
 
 ---
@@ -2265,51 +2112,30 @@ def is_sleeping(self) -> bool:
 这是用户可见的 API 层，改动最少。在 `LLM` 类中添加：
 
 ```python
-from vllm.v1.engine.core import PauseMode  # 类型别名：Literal["abort", "wait", "keep"]
+> **版本说明**：新版 `LLM.sleep()` 接受 `mode` 参数（`"abort"/"wait"/"keep"`）。v0.6.6 只实现了 `mode="abort"`（默认），不需要 `mode` 参数。调用链：`LLM` → V1 `LLMEngine` → `InprocClient` → `EngineCore`。
 
+```python
+# vllm/entrypoints/llm.py
 class LLM:
-    # ...已有方法...
+    def sleep(self, level: int = 1) -> None:
+        """Release GPU memory. level=1: offload weights; level=2: discard all."""
+        self.llm_engine.sleep(level=level)
 
-    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
-        """
-        让推理引擎进入睡眠，释放 GPU 显存。
-
-        Args:
-            level:
-                0 - 仅暂停调度，不动 GPU 内存（短暂暂停，维持所有显存）
-                1 - offload 模型权重到 CPU，丢弃 KV Cache（默认）
-                    wake_up() 后可继续使用同一模型推理
-                2 - 丢弃所有 GPU 内存（权重 + KV Cache，不备份到 CPU）
-                    适合 RLHF 场景：训练后权重已更新，旧权重无用
-            mode:
-                "abort" - 立即中止所有 in-flight 请求（默认）
-                "keep"  - 暂停但保留请求（wake_up 后继续）
-                "wait"  - 等所有 in-flight 请求完成再 sleep（仅异步引擎）
-
-        典型用法（RLHF level 2）：
-            llm.sleep(level=2)
-            # ... 训练框架更新权重 ...
-            llm.wake_up(tags=["weights"])
-            llm.collective_rpc("reload_weights")
-            llm.wake_up(tags=["kv_cache"])
-            output = llm.generate(...)
-        """
-        self.llm_engine.sleep(level=level, mode=mode)
-
-    def wake_up(self, tags: list[str] | None = None) -> None:
-        """
-        唤醒引擎，恢复 GPU 显存。
-
-        Args:
-            tags: 要唤醒的内存类型。
-                None         - 唤醒所有内存（完整唤醒）
-                ["weights"]  - 只唤醒权重（后续可更新权重）
-                ["kv_cache"] - 只唤醒 KV Cache（唤醒权重后使用）
-                ["scheduling"] - 只恢复调度（level 0 的唤醒）
-
-        注意：分步唤醒时（先 weights 后 kv_cache），两步都完成后才能 generate()
-        """
+    def wake_up(self, tags=None) -> None:
+        """Restore GPU memory. tags=None: restore all; tags=["weights"/"kv_cache"]: partial."""
         self.llm_engine.wake_up(tags)
+```
+
+**调用链**（v0.6.6）：
+
+```
+LLM.sleep(level)
+  → V1 LLMEngine.sleep(level)          # llm_engine.py
+    → InprocClient.sleep(level)         # core_client.py
+      → EngineCore.sleep(level)         # core.py：abort 所有请求
+        → UniprocExecutor.sleep(level)  # uniproc_executor.py：直接调用 worker
+          → Worker.sleep(level)         # gpu_worker.py
+            → CuMemAllocator.sleep()   # cumem.py
 ```
 
 ---
@@ -2570,15 +2396,35 @@ if __name__ == "__main__":
 运行测试：
 
 ```bash
-# 运行所有 sleep mode 相关测试
-.venv/bin/python -m pytest tests/basic_correctness/test_cumem.py -v
+# 单独运行端到端测试（推荐：每个测试独立进程，无 singleton 污染）
+VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  .venv/bin/python tests/sleep_mode/test_end_to_end_level1.py
 
-# 运行单个测试
-.venv/bin/python -m pytest tests/basic_correctness/test_cumem.py::test_end_to_end -v -s
+VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  .venv/bin/python tests/sleep_mode/test_end_to_end_level2_partial_wakeup.py
 
-# 验证基础功能（不需要 GPU）
-.venv/bin/python tests/test_sleep_mode.py
+# 运行基础 allocator 单元测试（不需要完整模型）
+.venv/bin/python tests/sleep_mode/test_cumem_basic.py
 ```
+
+**环境变量说明**：
+
+| 变量 | 值 | 说明 |
+|------|-----|------|
+| `VLLM_USE_V1` | `1` | 使用 V1 引擎（有 cumem pool 支持）；默认 V0 引擎没有 sleep 实现 |
+| `VLLM_ENABLE_V1_MULTIPROCESSING` | `0` | 禁用 V1 多进程模式（`InprocClient`）；避免首次启动时 CUDA 已初始化导致 spawn 冲突 |
+
+**`max_model_len` 说明**：8GB GPU + V1 引擎（torch.compile 消耗额外显存）需要显式设置 `max_model_len=2048`，否则 KV cache 不足会报 `max_seq_len > max tokens in KV cache` 错误。
+
+> **同进程多 LLM 测试的注意事项**：`CuMemAllocator` 是进程级单例，单进程内不能同时运行多个 `LLM(enable_sleep_mode=True)` 实例。如需在同一进程连续测试多个实例（如 `test_sleep_mode.py` 的主函数），每次初始化前需手动清理：
+> ```python
+> alloc = CuMemAllocator.get_instance()
+> alloc.allocator_and_pools.clear()
+> for _ in range(3): gc.collect()
+> torch.cuda.synchronize(); torch.cuda.empty_cache()
+> alloc.pointer_to_data.clear()
+> CuMemAllocator.instance = None
+> ```
 
 ---
 
@@ -2590,9 +2436,9 @@ if __name__ == "__main__":
 | Step 2 | `CMakeLists.txt` | **修改** | 添加 `cumem_allocator` 扩展目标和编译规则 |
 | Step 4 | `vllm/device_allocator/__init__.py` | **新建** | 空文件（Python package 标识）|
 | Step 4 | `vllm/device_allocator/cumem.py` | **新建** | `CuMemAllocator` 单例类（内存池管理）|
-| Step 5 | `vllm/v1/worker/gpu_worker.py` | **修改** | 添加 `_sleep_saved_buffers`、`_maybe_get_memory_pool_context()`、`sleep()`、`wake_up()`；修改 `load_model` 和 `initialize_from_config` 加上 cumem 上下文 |
-| Step 5 | `vllm/v1/worker/gpu_model_runner.py` | **修改** | 添加 `post_kv_cache_wake_up()` 和 `init_fp8_kv_scales()` |
-| Step 6 | `vllm/config/model.py` | **修改** | `ModelConfig` 添加 `enable_sleep_mode`、`enable_cumem_allocator` 字段及验证逻辑 |
+| Step 5 | `vllm/v1/worker/gpu_worker.py` | **修改** | 添加 `_sleep_saved_buffers`、`_maybe_get_memory_pool_context()`、`sleep()`、`wake_up()`、`reload_weights()`；修改 `load_model`（包裹 cumem 上下文，不传 `load_dummy_weights`）和 `initialize_cache` |
+| Step 5 | `vllm/v1/worker/gpu_model_runner.py` | **修改** | 添加 `post_kv_cache_wake_up()`（FP8 修复）、`reload_weights()`（level 2 唤醒后重加载权重） |
+| Step 6 | `vllm/config.py` | **修改** | `ModelConfig.__init__` 添加 `enable_sleep_mode`、`enable_cumem_allocator` 参数及验证逻辑（**必须在 `ModelConfig.__init__` 内，不能放入其他类**） |
 | Step 6 | `vllm/platforms/interface.py` | **修改** | `Platform` 添加 `is_sleep_mode_available()` 方法 |
 | Step 6 | `vllm/engine/arg_utils.py` | **修改** | `EngineArgs` 添加 `--enable-sleep-mode` 和 `--enable-cumem-allocator` CLI 参数 |
 | Step 7 | `vllm/v1/executor/abstract.py` | **修改** | `Executor` 添加 `is_sleeping`、`sleeping_tags` 字段和 `sleep()`、`wake_up()` 方法 |

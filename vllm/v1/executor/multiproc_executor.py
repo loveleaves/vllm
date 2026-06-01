@@ -208,6 +208,19 @@ class MultiprocExecutor(Executor):
         self.collective_rpc("check_health", timeout=10)
         return
 
+    def sleep(self, level: int = 1) -> None:
+        t0 = time.monotonic()
+        self.collective_rpc("sleep", kwargs=dict(level=level))
+        logger.info("It took %.6f seconds to fall asleep.", time.monotonic() - t0)
+        self.is_sleeping = True
+
+    def wake_up(self, tags=None) -> None:
+        t0 = time.monotonic()
+        self.collective_rpc("wake_up", kwargs=dict(tags=tags))
+        logger.info("It took %.6f seconds to wake up tags %s.", time.monotonic() - t0, tags)
+        if tags is None:
+            self.is_sleeping = False
+
 
 @dataclass
 class WorkerProcHandle:

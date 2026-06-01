@@ -223,7 +223,9 @@ class ModelConfig:
                  override_neuron_config: Optional[Dict[str, Any]] = None,
                  override_pooler_config: Optional["PoolerConfig"] = None,
                  logits_processor_pattern: Optional[str] = None,
-                 generation_config: Optional[str] = None) -> None:
+                 generation_config: Optional[str] = None,
+                 enable_sleep_mode: bool = False,
+                 enable_cumem_allocator: bool = False) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
@@ -360,6 +362,28 @@ class ModelConfig:
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
+        self.enable_sleep_mode = enable_sleep_mode
+        self.enable_cumem_allocator = enable_cumem_allocator
+
+        if self.enable_sleep_mode:
+            if not current_platform.is_sleep_mode_available():
+                raise ValueError(
+                    "Sleep mode is not supported on current platform. "
+                    "Only CUDA and ROCm are supported."
+                )
+            if not self.enable_cumem_allocator:
+                logger.info(
+                    "Enabling cumem allocator because sleep mode requires it."
+                )
+                self.enable_cumem_allocator = True
+
+        if self.enable_cumem_allocator:
+            from vllm.device_allocator.cumem import cumem_available
+            if not cumem_available:
+                raise ValueError(
+                    "cumem allocator is not available. "
+                    "Ensure the C extension was compiled (requires CUDA/ROCm)."
+                )
 
     def maybe_pull_model_tokenizer_for_s3(self, model: str,
                                           tokenizer: str) -> None:
@@ -1090,7 +1114,7 @@ class TokenizerPoolConfig:
             raise ValueError(f"Unknown pool type: {self.pool_type}")
         if not isinstance(self.extra_config, dict):
             raise ValueError("extra_config must be a dictionary.")
-
+        
     @classmethod
     def create_config(
         cls, tokenizer_pool_size: int,

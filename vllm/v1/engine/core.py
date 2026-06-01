@@ -127,6 +127,17 @@ class EngineCore:
             scheduler_output, output)
         return engine_core_outputs
 
+    def sleep(self, level: int = 1) -> None:
+        # Abort all in-flight requests before releasing GPU memory.
+        all_ids = list(self.scheduler.requests.keys())
+        if all_ids:
+            self.scheduler.finish_requests(all_ids,
+                                           RequestStatus.FINISHED_ABORTED)
+        self.model_executor.sleep(level)
+
+    def wake_up(self, tags: List[str] | None = None) -> None:
+        self.model_executor.wake_up(tags)
+
     def shutdown(self):
         self.model_executor.shutdown()
 

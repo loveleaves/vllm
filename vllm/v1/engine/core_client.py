@@ -78,6 +78,12 @@ class EngineCoreClient:
     async def abort_requests_async(self, request_ids: List[str]) -> None:
         raise NotImplementedError
 
+    def sleep(self, level: int = 1) -> None:
+        raise NotImplementedError
+
+    def wake_up(self, tags=None) -> None:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -104,13 +110,20 @@ class InprocClient(EngineCoreClient):
         self.engine_core.abort_requests(request_ids)
 
     def shutdown(self):
-        self.engine_core.shutdown()
+        if hasattr(self, 'engine_core'):
+            self.engine_core.shutdown()
 
     def __del__(self):
         self.shutdown()
 
     def profile(self, is_start: bool = True) -> None:
         self.engine_core.profile(is_start)
+
+    def sleep(self, level: int = 1) -> None:
+        self.engine_core.sleep(level)
+
+    def wake_up(self, tags=None) -> None:
+        self.engine_core.wake_up(tags)
 
 
 class MPClient(EngineCoreClient):

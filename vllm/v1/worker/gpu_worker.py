@@ -23,6 +23,7 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
+from contextlib import AbstractContextManager, nullcontext
 
 
 class Worker:
@@ -73,6 +74,32 @@ class Worker:
                     torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+        
+        # 用于 level 2 sleep 前保存模型 buffers（buffers 不在 cumem pool 中）
+        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+
+    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        """
+        如果 enable_cumem_allocator=True，返回打标签的 cumem 内存池上下文；
+        否则返回 nullcontext（什么都不做，代码路径完全透明）。
+
+        这个方法让调用方代码不需要判断 sleep mode 是否开启：
+            with self._maybe_get_memory_pool_context("weights"):
+                self.model_runner.load_model()
+        """
+        if not self.vllm_config.model_config.enable_cumem_allocator:
+            return nullcontext()
+
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        allocator = CuMemAllocator.get_instance()
+        if tag == "weights":
+            # 单例约束检查：首次进入 weights pool 时，pool 必须为空
+            # 如果非空，说明进程中已有另一个 vLLM 实例在使用，会导致冲突
+            assert allocator.get_current_usage() == 0, (
+                "CuMem allocator can only be used for one instance per process."
+            )
+        return allocator.use_memory_pool(tag=tag)
 
     def initialize(self):
         if self.device_config.device.type == "cuda":
@@ -106,8 +133,71 @@ class Worker:
         # Construct the model runner
         self.model_runner = GPUModelRunner(self.vllm_config, self.device)
 
-    def load_model(self) -> None:
-        self.model_runner.load_model()
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        with (
+            self._maybe_get_memory_pool_context(tag="weights")
+        ):
+            self.model_runner.load_model()
+
+    def sleep(self, level: int = 1) -> None:
+        """
+        释放 GPU 显存。
+
+        level=1：权重 offload 到 CPU pinned memory，KV Cache 直接丢弃
+        level=2：所有内存直接丢弃（调用方后续会更新权重，旧权重不需要保留）
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        free_bytes_before = torch.cuda.mem_get_info()[0]
+
+        # level 2：在丢弃权重前，先把 buffers 保存到 CPU
+        # buffers 不在 cumem pool 中，allocator.sleep() 不会处理它们
+        if level == 2:
+            model = self.model_runner.model
+            self._sleep_saved_buffers = {
+                name: buffer.cpu().clone()
+                for name, buffer in model.named_buffers()
+            }
+
+        allocator = CuMemAllocator.get_instance()
+        # level 1：备份 "weights" 到 CPU，丢弃 "kv_cache"
+        # level 2：所有 tag 都直接丢弃（offload_tags=空元组）
+        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+
+        free_bytes_after, total = torch.cuda.mem_get_info()
+        freed = free_bytes_after - free_bytes_before
+        used = total - free_bytes_after
+        assert freed >= 0, "Sleep 后显存使用量增加，逻辑有误"
+        logger.info(
+            "Sleep mode freed %.2f GiB, %.2f GiB still in use.",
+            freed / 1024**3, used / 1024**3,
+        )
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """
+        恢复 GPU 显存。
+
+        tags=None：恢复所有内存（完整唤醒）
+        tags=["weights"]：只恢复权重（分步唤醒第一步）
+        tags=["kv_cache"]：只恢复 KV Cache（分步唤醒第二步）
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        allocator = CuMemAllocator.get_instance()
+        allocator.wake_up(tags)
+
+        # 恢复 level 2 sleep 前保存的 buffers
+        if len(self._sleep_saved_buffers):
+            model = self.model_runner.model
+            for name, buffer in model.named_buffers():
+                if name in self._sleep_saved_buffers:
+                    # copy_ 是原地操作，不改变 tensor 对象，不影响 CUDA Graph 中的指针
+                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
+            self._sleep_saved_buffers = {}
+
+        # KV Cache 唤醒后需要修复 FP8 scale（见 Step 5.7）
+        if tags is None or "kv_cache" in tags:
+            self.model_runner.post_kv_cache_wake_up()
 
     @torch.inference_mode()
     def determine_num_available_blocks(self) -> Tuple[int, int]:
@@ -186,7 +276,12 @@ class Worker:
                 "`gpu_memory_utilization` or decreasing `max_model_len` when "
                 "initializing the engine.")
 
-        self.model_runner.initialize_kv_cache(num_gpu_blocks)
+        with self._maybe_get_memory_pool_context(tag="kv_cache"):
+            self.model_runner.initialize_kv_cache(num_gpu_blocks)
+
+    def reload_weights(self) -> None:
+        """level 2 wake_up 后重新加载权重（RLHF 场景：新权重已写入虚拟地址）。"""
+        self.model_runner.reload_weights()
 
     def compile_or_warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:

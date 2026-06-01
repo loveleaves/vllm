@@ -1846,6 +1846,12 @@ class LLMEngine:
             self.tokenizer.check_health()
         self.model_executor.check_health()
 
+    def sleep(self, level: int = 1) -> None:
+        self.model_executor.sleep(level)
+
+    def wake_up(self, tags=None) -> None:
+        self.model_executor.wake_up(tags)
+
     def start_profile(self) -> None:
         # using type instead of isinstance to check to avoid capturing
         # inherited classes (MultiprocessingGPUExecutor)
