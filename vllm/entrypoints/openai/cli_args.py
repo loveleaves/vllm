@@ -14,6 +14,7 @@ from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
                                          validate_chat_template)
 from vllm.entrypoints.openai.serving_models import (LoRAModulePath,
                                                     PromptAdapterPath)
+from vllm.entrypoints.openai.reasoning_parsers import ReasoningParserManager
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.utils import FlexibleArgumentParser
 
@@ -230,6 +231,23 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         " into OpenAI API format, the name register in this plugin can be used "
         "in ``--tool-call-parser``.")
 
+    parser.add_argument(
+        "--enable-reasoning",
+        action="store_true",
+        default=False,
+        help="Enable reasoning content parsing for models that produce "
+        "<think>…</think> blocks (e.g. DeepSeek-R1, Qwen3). "
+        "Use ``--reasoning-parser`` to specify the parser.")
+
+    valid_reasoning_parsers = ReasoningParserManager.reasoning_parsers.keys()
+    parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        metavar="{" + ",".join(valid_reasoning_parsers) + "}",
+        default=None,
+        help="Select the reasoning parser for models that emit "
+        "<think>…</think> blocks. Required when ``--enable-reasoning`` is set.")
+
     parser = AsyncEngineArgs.add_cli_args(parser)
 
     parser.add_argument('--max-log-len',
@@ -266,6 +284,14 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     if args.enable_auto_tool_choice and not args.tool_call_parser:
         raise TypeError("Error: --enable-auto-tool-choice requires "
                         "--tool-call-parser")
+
+    # Reasoning parser validation
+    if args.enable_reasoning and not args.reasoning_parser:
+        raise TypeError("Error: --enable-reasoning requires --reasoning-parser")
+    if args.enable_reasoning and args.enable_auto_tool_choice:
+        raise TypeError(
+            "Error: --enable-reasoning and --enable-auto-tool-choice are "
+            "mutually exclusive")
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:
